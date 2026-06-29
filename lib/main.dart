@@ -25,8 +25,6 @@ Future<void> main() async {
 // --- PERSISTENT APP STATE ---
 class AppState {
   static String? loggedInUser;
-  static String? employeeToken;
-  static String? refreshToken; // 💥 Added Refresh Token 
   static String? adminToken;      
   static String? adminRole;       
   static bool isPunchedIn = false;
@@ -36,8 +34,6 @@ class AppState {
   static Future<void> saveState() async {
     final prefs = await SharedPreferences.getInstance();
     if (loggedInUser != null) await prefs.setString('loggedInUser', loggedInUser!);
-    if (employeeToken != null) await prefs.setString('employeeToken', employeeToken!);
-    if (refreshToken != null) await prefs.setString('refreshToken', refreshToken!);
     await prefs.setBool('isPunchedIn', isPunchedIn);
     
     if (punchInTime != null) {
@@ -56,8 +52,6 @@ class AppState {
   static Future<void> loadState() async {
     final prefs = await SharedPreferences.getInstance();
     loggedInUser = prefs.getString('loggedInUser');
-    employeeToken = prefs.getString('employeeToken');
-    refreshToken = prefs.getString('refreshToken'); // 💥 Load Refresh Token
     isPunchedIn = prefs.getBool('isPunchedIn') ?? false;
     
     String? pIn = prefs.getString('punchInTime');
@@ -67,18 +61,30 @@ class AppState {
     if (pOut != null) punchOutTime = DateTime.parse(pOut);
   }
 
+  // 💥 NOTE: loggedInUser is intentionally preserved across clearState() calls.
+  // Employees stay associated with their entered ID across normal logout/app
+  // restarts. Use clearLoggedInUser() (e.g. from a "Switch User"/"Change ID"
+  // action) to explicitly reset it.
   static Future<void> clearState() async {
     final prefs = await SharedPreferences.getInstance();
+    final preservedUser = loggedInUser;
     await prefs.clear();
+    if (preservedUser != null) await prefs.setString('loggedInUser', preservedUser);
     
-    loggedInUser = null;
-    employeeToken = null;
-    refreshToken = null; // 💥 Clear Refresh Token
+    loggedInUser = preservedUser;
     adminToken = null;
     adminRole = null;
     isPunchedIn = false;
     punchInTime = null;
     punchOutTime = null;
+  }
+
+  // 💥 Explicitly clears the stored employee ID. Call this from a
+  // "Switch User" / "Change ID" action if one is added to the UI.
+  static Future<void> clearLoggedInUser() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('loggedInUser');
+    loggedInUser = null;
   }
 
   static String formatTime(DateTime? time) {
@@ -133,13 +139,12 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
     await AppState.loadState();
     
     // Ping server to verify active status
-    if (AppState.employeeToken != null) {
+    if (AppState.loggedInUser != null) {
       try {
         var response = await http.get(
-          Uri.parse("$BASE_URL/status"),
+          Uri.parse("$BASE_URL/status?employee_id=${AppState.loggedInUser}"),
           headers: {
             'ngrok-skip-browser-warning': 'true',
-            'Authorization': 'Bearer ${AppState.employeeToken}'
           },
         ).timeout(const Duration(seconds: 5));
         
@@ -162,10 +167,10 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
     await Future.delayed(const Duration(milliseconds: 1500));
 
     if (mounted) {
-      if (AppState.loggedInUser != null && AppState.employeeToken != null) {
+      if (AppState.loggedInUser != null) {
         Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const DashboardScreen()));
       } else {
-        Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const LoginScreen()));
+        Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const EmployeeIdScreen()));
       }
     }
   }
@@ -197,93 +202,40 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
   }
 }
 
-// --- 2. LOGIN SCREEN (2FA ENABLED) ---
-class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+// --- 2. EMPLOYEE ID SCREEN (NO AUTH — TRUST-BASED) ---
+class EmployeeIdScreen extends StatefulWidget {
+  const EmployeeIdScreen({super.key});
 
   @override
-  State<LoginScreen> createState() => _LoginScreenState();
+  State<EmployeeIdScreen> createState() => _EmployeeIdScreenState();
 }
 
-class _LoginScreenState extends State<LoginScreen> {
+class _EmployeeIdScreenState extends State<EmployeeIdScreen> {
   final TextEditingController _idController = TextEditingController();
-  final TextEditingController _pinController = TextEditingController();
-  final TextEditingController _otpController = TextEditingController();
-  
-  bool _isLoading = false;
-  bool _isOtpMode = false;
-  String _maskedMobile = "";
 
-  Future<void> _performLoginStep1() async {
-    if (_idController.text.trim().isEmpty || _pinController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("ID and PIN required"), backgroundColor: Colors.red));
+  @override
+  void dispose() {
+    _idController.dispose();
+    super.dispose();
+  }
+
+  void _continue() {
+    final enteredId = _idController.text.trim();
+    if (enteredId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Employee ID required"), backgroundColor: Colors.red));
       return;
     }
 
-    setState(() => _isLoading = true);
+    AppState.loggedInUser = enteredId;
+    AppState.saveState();
 
-    try {
-      var response = await http.post(
-        Uri.parse("$BASE_URL/login/step1"),
-        headers: {'ngrok-skip-browser-warning': 'true'},
-        body: {'employee_id': _idController.text.trim(), 'pin': _pinController.text.trim()},
-      );
-
-      final respStr = response.body;
-      if (mounted) {
-        if (response.statusCode == 200) {
-          var data = jsonDecode(respStr);
-          setState(() {
-            _maskedMobile = data['masked_mobile'];
-            _isOtpMode = true;
-          });
-        } else {
-          throw Exception(jsonDecode(respStr)['detail']);
-        }
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString().replaceAll("Exception: ", "")), backgroundColor: Colors.red));
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
-  }
-
-  Future<void> _performLoginStep2() async {
-    if (_otpController.text.trim().isEmpty) return;
-    setState(() => _isLoading = true);
-
-    try {
-      var response = await http.post(
-        Uri.parse("$BASE_URL/login/step2"),
-        headers: {'ngrok-skip-browser-warning': 'true'},
-        body: {'employee_id': _idController.text.trim(), 'otp': _otpController.text.trim()},
-      );
-
-      if (mounted) {
-        if (response.statusCode == 200) {
-          var data = jsonDecode(response.body);
-          AppState.loggedInUser = data['employee_id'];
-          AppState.employeeToken = data['access_token']; 
-          AppState.refreshToken = data['refresh_token']; // 💥 Save Refresh Token
-          await AppState.saveState();
-          
-          Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const DashboardScreen()));
-        } else {
-          throw Exception(jsonDecode(response.body)['detail']);
-        }
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString().replaceAll("Exception: ", "")), backgroundColor: Colors.red));
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
+    Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const DashboardScreen()));
   }
 
   Future<void> _showAdminAuthDialog() async {
     final TextEditingController userCtrl = TextEditingController();
     final TextEditingController passCtrl = TextEditingController();
     bool isChecking = false;
-
     await showDialog(
       context: context,
       builder: (dialogContext) {
@@ -295,47 +247,88 @@ class _LoginScreenState extends State<LoginScreen> {
               content: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  TextField(controller: userCtrl, decoration: InputDecoration(labelText: "Username", filled: true, fillColor: Colors.grey.shade900)),
+                  TextField(
+                    controller: userCtrl,
+                    decoration: InputDecoration(
+                      labelText: "Username",
+                      filled: true,
+                      fillColor: Colors.grey.shade900,
+                    ),
+                  ),
                   const SizedBox(height: 10),
-                  TextField(controller: passCtrl, obscureText: true, decoration: InputDecoration(labelText: "Password", filled: true, fillColor: Colors.grey.shade900)),
-                  if (isChecking) const Padding(padding: EdgeInsets.only(top: 20), child: CircularProgressIndicator(color: sjvnBlue))
+                  TextField(
+                    controller: passCtrl,
+                    obscureText: true,
+                    decoration: InputDecoration(
+                      labelText: "Password",
+                      filled: true,
+                      fillColor: Colors.grey.shade900,
+                    ),
+                  ),
+                  if (isChecking)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 20),
+                      child: CircularProgressIndicator(color: sjvnBlue),
+                    ),
                 ],
               ),
               actions: [
-                TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text("Cancel")),
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text("Cancel"),
+                ),
                 ElevatedButton(
-                  style: ElevatedButton.styleFrom(backgroundColor: sjvnBlue, foregroundColor: Colors.white),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: sjvnBlue,
+                    foregroundColor: Colors.white,
+                  ),
                   onPressed: isChecking ? null : () async {
                     setDialogState(() => isChecking = true);
                     try {
                       var response = await http.post(
                         Uri.parse("$BASE_URL/admin/login"),
                         headers: {'ngrok-skip-browser-warning': 'true'},
-                        body: {'username': userCtrl.text.trim(), 'password': passCtrl.text.trim()},
+                        body: {
+                          'username': userCtrl.text.trim(),
+                          'password': passCtrl.text.trim(),
+                        },
                       );
-
                       if (response.statusCode == 200) {
                         var parsed = jsonDecode(response.body);
                         AppState.adminToken = parsed['access_token'];
                         AppState.adminRole = parsed['role'];
-                        
-                        if (mounted) Navigator.pop(dialogContext); 
-                        if (mounted) Navigator.push(context, MaterialPageRoute(builder: (context) => AdminSettingsScreen(role: parsed['role'])));
+                        if (mounted) Navigator.pop(dialogContext);
+                        if (mounted) {
+                          Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) =>
+                                AdminSettingsScreen(role: parsed['role']),
+                          ),
+                        );
+                        }
                       } else {
-                        throw Exception("Invalid Credentials");
+                        throw Exception(
+                            jsonDecode(response.body)['detail'] ??
+                                "Invalid Credentials");
                       }
                     } catch (e) {
                       setDialogState(() => isChecking = false);
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Access Denied"), backgroundColor: Colors.red));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(e.toString().replaceAll("Exception: ", "")),
+                          backgroundColor: Colors.red,
+                        ),
+                      );
                     }
                   },
                   child: const Text("Login"),
                 ),
               ],
             );
-          }
+          },
         );
-      }
+      },
     );
   }
 
@@ -353,49 +346,44 @@ class _LoginScreenState extends State<LoginScreen> {
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Icon(_isOtpMode ? Icons.security_update_good : Icons.lock_person, size: 80, color: sjvnBlue.withValues(alpha: 0.8)),
-                const SizedBox(height: 30),
-                Text(
-                  _isOtpMode ? "Enter Security OTP" : "Employee Authentication",
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [BoxShadow(color: sjvnBlue.withValues(alpha: 0.3), blurRadius: 20, spreadRadius: 3)]
+                  ),
+                  child: Image.asset('assets/sjvn_logo.png', height: 90),
                 ),
-                if (_isOtpMode) ...[
-                  const SizedBox(height: 10),
-                  Text("Sent to $_maskedMobile", textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54)),
-                ],
+                const SizedBox(height: 30),
+                const Text(
+                  "Enter Your Employee ID",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                ),
                 const SizedBox(height: 40),
-                
-                if (!_isOtpMode) ...[
-                  TextField(controller: _idController, decoration: InputDecoration(labelText: "Employee ID", prefixIcon: const Icon(Icons.badge, color: sjvnBlue), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), filled: true, fillColor: Colors.grey.shade900)),
-                  const SizedBox(height: 20),
-                  TextField(controller: _pinController, obscureText: true, keyboardType: TextInputType.number, decoration: InputDecoration(labelText: "Security PIN", prefixIcon: const Icon(Icons.password, color: sjvnBlue), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), filled: true, fillColor: Colors.grey.shade900)),
-                ] else ...[
-                  TextField(controller: _otpController, keyboardType: TextInputType.number, textAlign: TextAlign.center, style: const TextStyle(fontSize: 24, letterSpacing: 8), decoration: InputDecoration(labelText: "6-Digit Code", border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), filled: true, fillColor: Colors.grey.shade900)),
-                ],
-                
+
+                TextField(
+                  controller: _idController,
+                  textAlign: TextAlign.center,
+                  decoration: InputDecoration(
+                    labelText: "Employee ID",
+                    prefixIcon: const Icon(Icons.badge, color: sjvnBlue),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                    filled: true,
+                    fillColor: Colors.grey.shade900,
+                  ),
+                  onSubmitted: (_) => _continue(),
+                ),
+
                 const SizedBox(height: 40),
                 ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 20), backgroundColor: sjvnBlue, foregroundColor: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))),
-                  icon: _isLoading ? const SizedBox.shrink() : const Icon(Icons.login),
-                  label: _isLoading ? const CircularProgressIndicator(color: Colors.white) : Text(_isOtpMode ? "Verify & Enter" : "Request OTP", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  onPressed: _isLoading ? null : (_isOtpMode ? _performLoginStep2 : _performLoginStep1),
+                  icon: const Icon(Icons.arrow_forward),
+                  label: const Text("Continue", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  onPressed: _continue,
                 ),
-                
-                if (!_isOtpMode) ...[
-                  const SizedBox(height: 20),
-                  TextButton.icon(
-                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const RegistrationScreen())),
-                    icon: Icon(Icons.person_add, color: sjvnOrange.withValues(alpha: 0.8), size: 18),
-                    label: Text("Admin: Register New Employee", style: TextStyle(color: sjvnOrange.withValues(alpha: 0.8), decoration: TextDecoration.underline)),
-                  ),
-                ] else ...[
-                  const SizedBox(height: 20),
-                  TextButton(
-                    onPressed: () => setState(() { _isOtpMode = false; _otpController.clear(); }),
-                    child: const Text("Go Back", style: TextStyle(color: Colors.grey)),
-                  ),
-                ]
+
               ],
             ),
           ),
@@ -444,42 +432,15 @@ class _DashboardScreenState extends State<DashboardScreen>
   Future<void> _syncStatusFromServer() async {
     try {
       var response = await http.get(
-        Uri.parse("$BASE_URL/status"),
+        Uri.parse("$BASE_URL/status?employee_id=${AppState.loggedInUser}"),
         headers: {
           'ngrok-skip-browser-warning': 'true',
-          'Authorization': 'Bearer ${AppState.employeeToken}',
         },
       ).timeout(const Duration(seconds: 5));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         if (mounted) setState(() => AppState.isPunchedIn = data['is_punched_in']);
-      } else if (response.statusCode == 401 && AppState.refreshToken != null) {
-        // Access Token Expired. Attempt Silent Refresh.
-        var refreshRes = await http.post(
-          Uri.parse("$BASE_URL/refresh"),
-          headers: {'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true'},
-          body: jsonEncode({"refresh_token": AppState.refreshToken}),
-        );
-
-        if (refreshRes.statusCode == 200) {
-          var refreshData = jsonDecode(refreshRes.body);
-          AppState.employeeToken = refreshData['access_token'];
-          await AppState.saveState();
-          _syncStatusFromServer(); // Retry the original request
-        } else {
-          // Refresh Token also expired or invalid. Force log out.
-          await AppState.clearState();
-          if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginScreen()));
-        }
-      } else if (response.statusCode == 401) {
-        await AppState.clearState();
-        if (mounted) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (_) => const LoginScreen()),
-          );
-        }
       }
     } catch (_) {}
   }
@@ -496,7 +457,7 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   Future<void> _executeLogout() async {
     await AppState.clearState();
-    if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const LoginScreen()));
+    if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const EmployeeIdScreen()));
   }
 
   Future<void> _handleLogout() async {
@@ -525,7 +486,11 @@ class _DashboardScreenState extends State<DashboardScreen>
   void _navigateToCamera(String action, {bool logoutAfter = false}) async {
     final result = await Navigator.push(context, MaterialPageRoute(builder: (context) => CameraScreen(action: action)));
     if (result == true && mounted) {
-      if (logoutAfter) await _executeLogout(); else setState(() {}); 
+      if (logoutAfter) {
+        await _executeLogout();
+      } else {
+        setState(() {});
+      } 
     }
   }
 
@@ -671,7 +636,8 @@ class _CameraScreenState extends State<CameraScreen> {
       final XFile photo = await _controller.takePicture();
 
       var request = http.MultipartRequest('POST', Uri.parse("$BASE_URL/punch"));
-      request.headers.addAll({'ngrok-skip-browser-warning': 'true', 'Authorization': 'Bearer ${AppState.employeeToken}'});
+      request.headers.addAll({'ngrok-skip-browser-warning': 'true'});
+      request.fields['employee_id'] = AppState.loggedInUser!;
       request.fields['action'] = widget.action; 
       request.fields['latitude'] = position.latitude.toString();
       request.fields['longitude'] = position.longitude.toString();
@@ -736,6 +702,7 @@ class _CameraScreenState extends State<CameraScreen> {
 }
 
 // --- 5. REGISTRATION SCREEN ---
+// --- 5. REGISTRATION SCREEN ---
 class RegistrationScreen extends StatefulWidget {
   const RegistrationScreen({super.key});
 
@@ -749,7 +716,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   bool _isLoading = false;
   
   final TextEditingController _idController = TextEditingController();
-  final TextEditingController _pinController = TextEditingController();
+  final TextEditingController _pinController = TextEditingController(); // 💥 Added missing PIN controller
   final TextEditingController _mobileController = TextEditingController();
 
   @override
@@ -760,7 +727,6 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   void _initializeCamera() {
     final frontCamera = cameras.firstWhere((camera) => camera.lensDirection == CameraLensDirection.front, orElse: () => cameras.first);
-    // 💥 High Resolution & Locked Portrait
     _controller = CameraController(frontCamera, ResolutionPreset.high, enableAudio: false);
     _controller.initialize().then((_) async {
       if (!mounted) return;
@@ -773,7 +739,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   void dispose() {
     _controller.dispose();
     _idController.dispose();
-    _pinController.dispose();
+    _pinController.dispose(); // 💥 Dispose the new controller
     _mobileController.dispose();
     super.dispose();
   }
@@ -798,7 +764,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       request.headers.addAll({'ngrok-skip-browser-warning': 'true', 'Authorization': 'Bearer ${AppState.adminToken}'});
       
       request.fields['employee_id'] = _idController.text.trim();
-      request.fields['pin'] = _pinController.text.trim();
+      request.fields['pin'] = _pinController.text.trim(); // 💥 Ensure PIN is sent to server
       request.fields['mobile_number'] = _mobileController.text.trim();
       request.files.add(await http.MultipartFile.fromPath('photo', photo.path));
 
@@ -839,18 +805,31 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
               ),
             ),
             Expanded(
-              flex: 5,
+              flex: 6, // Gave slightly more space for the extra field
               child: SingleChildScrollView(
                 padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 10.0),
                 child: Column(
                   children: [
                     TextField(controller: _idController, decoration: InputDecoration(labelText: "New Employee ID", prefixIcon: const Icon(Icons.badge, color: sjvnBlue), filled: true, fillColor: Colors.grey.shade900, border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)))),
                     const SizedBox(height: 10),
-                    TextField(controller: _pinController, keyboardType: TextInputType.number, decoration: InputDecoration(labelText: "Create PIN", prefixIcon: const Icon(Icons.password, color: sjvnBlue), filled: true, fillColor: Colors.grey.shade900, border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)))),
-                    const SizedBox(height: 10),
                     
-                    // 💥 The Missing UI Field has been added here
-                    TextField(controller: _mobileController, keyboardType: TextInputType.phone, decoration: InputDecoration(labelText: "Mobile Number (For 2FA)", prefixIcon: const Icon(Icons.phone_android, color: sjvnBlue), filled: true, fillColor: Colors.grey.shade900, border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)))),
+                    // 💥 Re-added the missing PIN Field
+                    TextField(
+                      controller: _pinController, 
+                      keyboardType: TextInputType.number,
+                      maxLength: 6,
+                      decoration: InputDecoration(
+                        labelText: "Create 6-Digit PIN", 
+                        counterText: "", // Hides the max length counter text below the field
+                        prefixIcon: const Icon(Icons.password, color: sjvnBlue), 
+                        filled: true, 
+                        fillColor: Colors.grey.shade900, 
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))
+                      )
+                    ),
+                    const SizedBox(height: 10),
+
+                    TextField(controller: _mobileController, keyboardType: TextInputType.phone, decoration: InputDecoration(labelText: "Mobile Number", prefixIcon: const Icon(Icons.phone_android, color: sjvnBlue), filled: true, fillColor: Colors.grey.shade900, border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)))),
                     const SizedBox(height: 20),
                     
                     ElevatedButton.icon(
@@ -1312,6 +1291,28 @@ class _AdminSettingsScreenState extends State<AdminSettingsScreen> {
                                   icon: const Icon(Icons.shield),
                                   label: const Text("Create New Administrator", style: TextStyle(fontWeight: FontWeight.bold)),
                                   onPressed: _showAddAdminDialog,
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              SizedBox(
+                                width: double.infinity,
+                                child: ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(vertical: 16),
+                                    backgroundColor: sjvnBlue.withValues(alpha: 0.15),
+                                    foregroundColor: sjvnBlue,
+                                    elevation: 0,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                      side: BorderSide(color: sjvnBlue.withValues(alpha: 0.5)),
+                                    ),
+                                  ),
+                                  icon: const Icon(Icons.person_add),
+                                  label: const Text("Register New Employee", style: TextStyle(fontWeight: FontWeight.bold)),
+                                  onPressed: () => Navigator.push(
+                                    context,
+                                    MaterialPageRoute(builder: (context) => const RegistrationScreen()),
+                                  ),
                                 ),
                               ),
                               const SizedBox(height: 30),
