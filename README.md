@@ -38,8 +38,8 @@ A physical device or emulator for testing
 
 Clone the repository and install dependencies:
 
-git clone [https://github.com/carryonanmol/sjvn-attendance-app.git](https://github.com/carryonanmol/sjvn-attendance-app.git)
-cd sjvn-attendance-app
+git clone [https://github.com/carryonanmol/sjvn-attendance-app.git](https://github.com/carryonanmol/biometric-attendance-app.git)
+cd biometric-attendance-app
 flutter pub get
 
 
